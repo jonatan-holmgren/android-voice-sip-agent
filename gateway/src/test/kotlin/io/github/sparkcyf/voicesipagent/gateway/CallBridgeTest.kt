@@ -62,6 +62,25 @@ class CallBridgeTest {
         assertNull("clock detached", cellPort.clock)
     }
 
+    @Test fun incomingOfferCallbacksBracketBridgeHandling() {
+        bridge.stop()
+        val incomingCell = FakeEndpoint("cellular")
+        val outgoingSip = FakeEndpoint("sip")
+        val events = mutableListOf<String>()
+        bridge = CallBridge(
+            sideA = incomingCell, sideB = outgoingSip,
+            routeAtoB = { "302" }, routeBtoA = { it.target },
+            config = GatewayConfig(cellularInboundTarget = "302"),
+            onIncomingOffered = { events += "offered" },
+            onIncomingHandled = { events += "handled" },
+        )
+        bridge.start()
+        incomingCell.incoming("13800001234")
+        settle()
+        assertEquals(listOf("offered", "handled"), events)
+        assertEquals(1, outgoingSip.dialed.size)
+    }
+
     @Test
     fun lineIsPassedToTheOtherSide() {
         cell.incoming("13800001234", line = 1)

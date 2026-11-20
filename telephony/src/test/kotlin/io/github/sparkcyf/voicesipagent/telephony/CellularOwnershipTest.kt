@@ -49,6 +49,7 @@ class CellularOwnershipTest {
     private var defaultSim: PhoneAccountHandle? = simAccount
     private var defaultSlot = DefaultSim.SYSTEM
     private var inboundExcluded = emptySet<Int>()
+    private var acceptIncoming = true
     private val sims = object : SimSlots {
         override fun active() = listOf(SimSlot(0, 1, "Test", simAccount), SimSlot(1, 5, "Other", sim1Account))
         override fun slotOf(account: PhoneAccountHandle?) = when (account) {
@@ -81,7 +82,7 @@ class CellularOwnershipTest {
             if (earlyLoss) onLost("socket died during open")
             if (openFailure) error("mode not settled")
             Handle(failHandleClose).also { opened = it }
-        }, {}, main, Executor { audioTasks += it }, sims, { defaultSlot }, { inboundExcluded })
+        }, {}, main, Executor { audioTasks += it }, sims, { defaultSlot }, { inboundExcluded }, { acceptIncoming })
         endpoint.setReadiness(true, "ready")
         endpoint.setIncomingCallHandler { leg = it as CellularLeg }
         CellularEndpoint.attachService(service)
@@ -331,6 +332,16 @@ class CellularOwnershipTest {
         endpoint.onCallAdded(service, call)
         assertFalse(::leg.isInitialized)
         verify(call, never()).answer(anyInt())
+        verify(service, never()).setMuted(anyBoolean())
+    }
+
+    @Test fun onDemandOutboundModeLeavesEveryIncomingCellularCallUntouched() {
+        acceptIncoming = false
+        endpoint.onCallAdded(service, call)
+        assertFalse(::leg.isInitialized)
+        verify(call, never()).answer(anyInt())
+        verify(call, never()).disconnect()
+        verify(call, never()).reject(anyBoolean(), nullable(String::class.java))
         verify(service, never()).setMuted(anyBoolean())
     }
 

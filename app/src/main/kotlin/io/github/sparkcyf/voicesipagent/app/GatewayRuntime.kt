@@ -51,6 +51,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.LinkedHashMap
 
 data class HealthState(
     val shizuku: ShizukuConnector.State = ShizukuConnector.State.SHIZUKU_NOT_RUNNING,
@@ -60,6 +62,10 @@ data class HealthState(
     val privilegedDetail: String = "",
     val sip: EndpointStatus = EndpointStatus(false, "not configured"),
     val takeover: Boolean = true,
+    val onDemandSip: Boolean = false,
+    val gatewayLifecycle: GatewayLifecycle = GatewayLifecycle.DORMANT,
+    val lastWakeResult: String = "Never requested",
+    val lastWakeLatencyMs: Long? = null,
     /** Gateway dependencies can run only after the foreground service has started. */
     val gatewayRunning: Boolean = false,
     /** Takeover was switched off during a call; it takes effect when that call ends. */
@@ -94,7 +100,8 @@ data class HealthState(
 
     /** Takeover needs persistence even before setup; a retained dialer role needs a reminder. */
     val needsForegroundService: Boolean
-        get() = takeover || holdsDialer || session != null || calls.owned > 0
+        get() = (takeover && (!onDemandSip || gatewayRunning || session != null || calls.owned > 0)) ||
+            (!onDemandSip && holdsDialer) || session != null || calls.owned > 0
 }
 
 /**
@@ -116,7 +123,7 @@ class GatewayRuntime private constructor(context: Context) {
     // role immediately so opening the app or receiving BOOT_COMPLETED cannot flash an idle notification.
     private val _health = MutableStateFlow(run {
         val holds = holdsDialer()
-        HealthState(takeover = settings.takeover, holdsDialer = holds,
+        HealthState(takeover = settings.takeover, onDemandSip = settings.onDemandSip, holdsDialer = holds,
             effectiveCallAccess = CallAccess.effective(settings.callAccess, Build.VERSION.SDK_INT, holds))
     })
     val health: StateFlow<HealthState> = _health
@@ -147,6 +154,7 @@ class GatewayRuntime private constructor(context: Context) {
         logger = { AppLog.i(it) },
         defaultSlot = { settings.defaultSimSlot },
         inboundExcluded = { settings.inboundExcludedSlots },
+        acceptIncoming = { !settings.onDemandSip },
     )
     /** [SipUserAgent] or [PjsipEndpoint], per [GatewaySettings.sipStack]. */
     private var sip: CallEndpoint? = null
@@ -170,6 +178,12 @@ class GatewayRuntime private constructor(context: Context) {
     private var pendingDialerChange: DialerChange? = null
     private var dialerRetry: ScheduledFuture<*>? = null
     private var healthCheck: ScheduledFuture<*>? = null
+    private var onDemandIdleCheck: ScheduledFuture<*>? = null
+    private var wakeTimeoutCheck: ScheduledFuture<*>? = null
+    private val pendingIncomingOffers = AtomicInteger(0)
+    @Volatile private var onDemandStopInProgress = false
+    private var wakeStartedAtMs: Long? = null
+    private val wakeRequests = WakeRequestTracker(settingsStore::seenWakeRequests, settingsStore::recordWakeRequest)
     private var audioStatusCheck: ScheduledFuture<*>? = null
     private val sipGate = SipRegistrationGate(SIP_HOLD_GRACE_MS) { SystemClock.elapsedRealtime() }
     private var sipHoldCheck: ScheduledFuture<*>? = null
@@ -179,6 +193,7 @@ class GatewayRuntime private constructor(context: Context) {
     /** Certificate policy of the running pjsua2 library's TLS transport; worker thread only. */
     private var pjsuaTls: TlsPolicy? = null
     @Volatile private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val pendingWakeRequestIds = LinkedHashMap<String, Long>()
     private val dialerHandoffStore = DialerHandoffStore(app)
     private val dialerHandoff = DialerHandoff(app.packageName, dialerHandoffStore, object : DialerHandoff.Backend {
         private fun service() = shizuku.service ?: error("Shizuku not connected. Use system dialer selection.")
@@ -224,6 +239,9 @@ class GatewayRuntime private constructor(context: Context) {
             _health.update { it.copy(calls = snapshot, inCallServiceBound = CellularEndpoint.isInCallServiceBound) }
             worker.execute {
                 syncForegroundService()
+                _health.update { it.copy(gatewayLifecycle = if (settings.onDemandSip && snapshot.owned > 0)
+                    GatewayLifecycle.IN_CALL else it.gatewayLifecycle) }
+                scheduleOnDemandIdle()
                 if (!cellular.hasCalls && _health.value.session == null) applyDeferredChanges()
             }
         }
@@ -245,8 +263,18 @@ class GatewayRuntime private constructor(context: Context) {
         }
         configureCallAccess()
         _health.update { it.copy(takeover = settings.takeover) }
+        _health.update { it.copy(onDemandSip = settings.onDemandSip,
+            gatewayLifecycle = if (settings.onDemandSip) GatewayLifecycle.DORMANT else GatewayLifecycle.READY) }
         updateReadiness()
         if (!_health.value.takeover) shizuku.stop()
+        FcmPush.refresh(app, settings)
+        val pendingWakes = if (settings.onDemandSip && settings.takeover)
+            settingsStore.pendingWakeRequests(System.currentTimeMillis()) else emptyMap()
+        if (pendingWakes.isNotEmpty()) {
+            synchronized(pendingWakeRequestIds) { pendingWakeRequestIds.putAll(pendingWakes) }
+            val (requestId, expiry) = pendingWakes.entries.first().let { it.key to it.value }
+            launchWake(requestId, expiry)
+        }
     }
 
     /** Track ownership before promotion so destruction also cancels a failed start. */
@@ -260,6 +288,15 @@ class GatewayRuntime private constructor(context: Context) {
         if (serviceToken !== service) return@execute
         foregroundRunning = true
         foregroundRequested = true
+        if (settings.onDemandSip) {
+            _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.INITIALIZING) }
+            if (!hasUnexpiredWake()) {
+                _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.DORMANT,
+                    lastWakeResult = "Failed: wake request expired before startup") }
+                syncForegroundService()
+                return@execute
+            }
+        }
         startGateway()
         updateReadiness()
     }
@@ -280,13 +317,19 @@ class GatewayRuntime private constructor(context: Context) {
     private fun startGateway() {
         if (!gatewayEnabled || healthCheck != null) return
         configureCallAccess()
+        if (settings.onDemandSip) _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.WAKING) }
         startBackgroundTasks()
+        if (settings.onDemandSip) _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.REGISTERING) }
         startSip()
         rebuildBridge()
     }
 
     /** Stop producers before their dependencies; retain the helper for an explicit role handoff. */
     private fun stopGateway() {
+        onDemandIdleCheck?.cancel(false)
+        onDemandIdleCheck = null
+        wakeTimeoutCheck?.cancel(false)
+        wakeTimeoutCheck = null
         stopBackgroundTasks()
         runCatching { stopBridge() }.onFailure { AppLog.w("bridge cleanup failed", it) }
         runCatching { stopSip(releaseLibrary = true) }.onFailure { AppLog.w("SIP cleanup failed", it) }
@@ -301,7 +344,9 @@ class GatewayRuntime private constructor(context: Context) {
         if (pendingDialerChange == null) runCatching { shizuku.stop() }
             .onFailure { AppLog.w("Shizuku cleanup failed", it) }
         _health.update { it.copy(privileged = null, sip = EndpointStatus(false,
-            if (it.takeover) "gateway stopped" else "takeover off")) }
+            if (it.takeover) "gateway stopped" else "takeover off"),
+            gatewayLifecycle = if (it.onDemandSip && onDemandStopInProgress) GatewayLifecycle.STOPPING
+                else if (it.onDemandSip) GatewayLifecycle.DORMANT else it.gatewayLifecycle) }
     }
 
     private fun startBackgroundTasks() {
@@ -470,7 +515,7 @@ class GatewayRuntime private constructor(context: Context) {
         }
         val problem = when {
             h.dialerChangeRunning -> "Changing the default dialer"
-            !gatewayEnabled -> "Gateway service not running"
+            !gatewayEnabled -> if (settings.onDemandSip) "Dormant; waiting for FCM wake" else "Gateway service not running"
             // Without Shizuku, privileged call-access health is unknown; report the root cause.
             h.shizuku != ShizukuConnector.State.CONNECTED -> shizukuProblem(h.shizuku)
             !access -> requirements.problem!!
@@ -525,10 +570,189 @@ class GatewayRuntime private constructor(context: Context) {
         val systemSim = cellular.sims.slotOf(cellular.sims.defaultAccount())
         _health.update { it.copy(gatewayRunning = gatewayEnabled, callAccessReady = access,
             audioReady = audio, cellularReady = ready, readinessDetail = detail, sims = sims, systemSimSlot = systemSim,
-            simWarning = simWarning(settings.defaultSimSlot, sims, systemSim)) }
+            simWarning = simWarning(settings.defaultSimSlot, sims, systemSim),
+            onDemandSip = settings.onDemandSip,
+            gatewayLifecycle = when {
+                !settings.onDemandSip -> if (gatewayEnabled) GatewayLifecycle.READY else GatewayLifecycle.DORMANT
+                !gatewayEnabled -> if (h.gatewayLifecycle == GatewayLifecycle.ERROR && h.lastWakeResult.startsWith("Failed"))
+                    GatewayLifecycle.ERROR else GatewayLifecycle.DORMANT
+                hasActiveWork() -> GatewayLifecycle.IN_CALL
+                ready && onDemandIdleCheck != null -> GatewayLifecycle.IDLE_GRACE
+                ready -> GatewayLifecycle.READY
+                h.sip.detail.startsWith("start failed") -> GatewayLifecycle.ERROR
+                else -> h.gatewayLifecycle
+            }) }
+        if (settings.onDemandSip && ready && wakeStartedAtMs != null) markWakeReady()
         cellular.setReadiness(ready, detail)
         updateSipHold(c.problem)
         syncForegroundService()
+        scheduleOnDemandIdle()
+    }
+
+    /** FCM carries an availability request only; SIP still authenticates every call independently. */
+    fun requestWake(requestId: String, expiresAtEpochMs: Long): Boolean {
+        if (!settings.onDemandSip || !settings.takeover) {
+            reportWakeFailure("Failed: on-demand gateway is disabled")
+            return false
+        }
+        when (wakeRequests.accept(requestId, expiresAtEpochMs, System.currentTimeMillis())) {
+            WakeRequestDecision.ACCEPTED -> Unit
+            WakeRequestDecision.DUPLICATE -> {
+                val pending = settingsStore.pendingWakeRequests(System.currentTimeMillis())[requestId]
+                if (pending != null && !gatewayEnabled) return launchWake(requestId, pending)
+                if (pending != null && gatewayEnabled && _health.value.cellularReady) {
+                    worker.execute { confirmWakeReady(requestId) }
+                    return true
+                }
+                AppLog.i("ignored duplicate gateway wake")
+                return false
+            }
+            WakeRequestDecision.EXPIRED -> {
+                AppLog.i("ignored expired gateway wake")
+                reportWakeFailure("Failed: expired wake request")
+                return false
+            }
+            WakeRequestDecision.INVALID -> {
+                AppLog.w("ignored invalid gateway wake")
+                reportWakeFailure("Failed: invalid wake request")
+                return false
+            }
+        }
+        return launchWake(requestId, expiresAtEpochMs)
+    }
+
+    private fun launchWake(requestId: String, expiresAtEpochMs: Long): Boolean {
+        val acceptedAt = android.os.SystemClock.elapsedRealtime()
+        synchronized(pendingWakeRequestIds) { pendingWakeRequestIds[requestId] = expiresAtEpochMs }
+        val alreadyAwake = gatewayEnabled
+        val serviceStarted = alreadyAwake || GatewayService.startForWake(app)
+        worker.execute {
+            onDemandIdleCheck?.cancel(false)
+            onDemandIdleCheck = null
+            wakeStartedAtMs = acceptedAt
+            if (!serviceStarted) {
+                synchronized(pendingWakeRequestIds) { pendingWakeRequestIds.remove(requestId) }
+                settingsStore.completeWakeRequest(requestId)
+                wakeStartedAtMs = null
+                _health.update { it.copy(lastWakeResult = "Failed: Android blocked service startup",
+                    gatewayLifecycle = GatewayLifecycle.ERROR) }
+            } else {
+                _health.update { it.copy(lastWakeResult = "Wake accepted", lastWakeLatencyMs = null,
+                    gatewayLifecycle = GatewayLifecycle.WAKING) }
+                if (gatewayEnabled && _health.value.sip.ready) markWakeReady()
+                else scheduleWakeTimeout()
+            }
+        }
+        return serviceStarted
+    }
+
+    private fun confirmWakeReady(requestId: String) {
+        FcmPush.reportReady(app, settings, requestId) { success -> worker.execute {
+            if (success) {
+                settingsStore.completeWakeRequest(requestId)
+                AppLog.i("wake readiness confirmed by server")
+            } else _health.update { it.copy(lastWakeResult = "Failed: server readiness confirmation") }
+        } }
+    }
+
+    fun reportWakeFailure(reason: String) = worker.execute {
+        _health.update { it.copy(lastWakeResult = reason,
+            gatewayLifecycle = if (settings.onDemandSip && !gatewayEnabled) GatewayLifecycle.ERROR else it.gatewayLifecycle) }
+    }
+
+    private fun scheduleWakeTimeout() {
+        wakeTimeoutCheck?.cancel(false)
+        wakeTimeoutCheck = worker.schedule({
+            wakeTimeoutCheck = null
+            if (settings.onDemandSip && gatewayEnabled && !_health.value.cellularReady) {
+                val failure = if (shizuku.state != ShizukuConnector.State.CONNECTED)
+                    "Failed: Shizuku unavailable" else "Failed: SIP or cellular readiness timeout"
+                _health.update { it.copy(lastWakeResult = failure, gatewayLifecycle = GatewayLifecycle.ERROR) }
+                val expiredWakes = synchronized(pendingWakeRequestIds) {
+                    pendingWakeRequestIds.toList().also { pendingWakeRequestIds.clear() }
+                }
+                expiredWakes.forEach { (requestId, _) -> settingsStore.completeWakeRequest(requestId) }
+                wakeStartedAtMs = null
+                AppLog.w("on-demand wake timed out: ${failure.removePrefix("Failed: ")}")
+                stopOnDemandAfterCleanup()
+            }
+        }, WAKE_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+    }
+
+    private fun scheduleOnDemandIdle() {
+        if (!settings.onDemandSip || !gatewayEnabled || hasActiveWork()) {
+            onDemandIdleCheck?.cancel(false)
+            onDemandIdleCheck = null
+            return
+        }
+        if (!_health.value.sip.ready) return
+        if (onDemandIdleCheck != null) return
+        _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.IDLE_GRACE) }
+        onDemandIdleCheck = worker.schedule({
+            onDemandIdleCheck = null
+            if (!settings.onDemandSip || hasActiveWork()) return@schedule
+            val startedAt = wakeStartedAtMs
+            val latency = startedAt?.let { (android.os.SystemClock.elapsedRealtime() - it).coerceAtLeast(0) }
+            _health.update { it.copy(lastWakeResult = "Ready; idle timeout elapsed", lastWakeLatencyMs = latency,
+                gatewayLifecycle = GatewayLifecycle.STOPPING) }
+            stopOnDemandAfterCleanup()
+        }, settings.idleTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+    }
+
+    private fun stopOnDemandAfterCleanup() {
+        if (onDemandStopInProgress) return
+        onDemandStopInProgress = true
+        AppLog.i("on-demand SIP idle; unregistering and releasing gateway resources")
+        stopGateway()
+        sipSocketRelease.whenComplete { _, failure -> worker.execute {
+            onDemandStopInProgress = false
+            if (failure != null) {
+                val reason = "Failed: SIP resource teardown"
+                _health.update { it.copy(lastWakeResult = reason, gatewayLifecycle = GatewayLifecycle.ERROR) }
+                AppLog.w("on-demand SIP resource teardown failed", failure)
+                return@execute
+            }
+            val hasNewWake = hasUnexpiredWake()
+            if (settings.onDemandSip && hasNewWake && _health.value.takeover) {
+                foregroundRunning = true
+                _health.update { it.copy(gatewayRunning = true, gatewayLifecycle = GatewayLifecycle.WAKING) }
+                startGateway()
+                updateReadiness()
+            } else {
+                foregroundRunning = false
+                _health.update { it.copy(gatewayRunning = false, gatewayLifecycle = GatewayLifecycle.DORMANT) }
+                syncForegroundService()
+            }
+        } }
+    }
+
+    private fun markWakeReady() {
+        val startedAt = wakeStartedAtMs ?: return
+        val latency = (android.os.SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0)
+        wakeStartedAtMs = null
+        wakeTimeoutCheck?.cancel(false)
+        wakeTimeoutCheck = null
+        _health.update { it.copy(lastWakeResult = "Gateway ready", lastWakeLatencyMs = latency,
+            gatewayLifecycle = if (hasActiveWork()) GatewayLifecycle.IN_CALL else GatewayLifecycle.IDLE_GRACE) }
+        AppLog.i("on-demand gateway ready in ${latency}ms")
+        scheduleOnDemandIdle()
+        val now = System.currentTimeMillis()
+        val expired = mutableListOf<String>()
+        val requestIds = synchronized(pendingWakeRequestIds) {
+            expired += pendingWakeRequestIds.filterValues { it <= now }.keys
+            expired.forEach(pendingWakeRequestIds::remove)
+            pendingWakeRequestIds.keys.toList().also { pendingWakeRequestIds.clear() }
+        }
+        expired.forEach(settingsStore::completeWakeRequest)
+        requestIds.forEach(::confirmWakeReady)
+    }
+
+    private fun hasUnexpiredWake(): Boolean = synchronized(pendingWakeRequestIds) {
+        val now = System.currentTimeMillis()
+        val expired = pendingWakeRequestIds.filterValues { it <= now }.keys.toList()
+        expired.forEach(pendingWakeRequestIds::remove)
+        expired.forEach(settingsStore::completeWakeRequest)
+        pendingWakeRequestIds.isNotEmpty()
     }
 
     // ------------------------------------------------------------ SIP registration hold
@@ -591,7 +815,8 @@ class GatewayRuntime private constructor(context: Context) {
         if (GatewayService.sync(app, h)) foregroundRequested = h.needsForegroundService
     }
 
-    private fun hasActiveWork() = cellular.hasCalls || bridge?.session != null || _health.value.session != null
+    private fun hasActiveWork() = cellular.hasCalls || pendingIncomingOffers.get() > 0 ||
+        bridge?.session != null || _health.value.session != null
 
     fun showDialerMessage(message: String) { _dialerMessage.value = message }
 
@@ -902,13 +1127,29 @@ class GatewayRuntime private constructor(context: Context) {
                 else -> null
             } },
             log = { AppLog.i("bridge: $it") },
+            onIncomingOffered = {
+                pendingIncomingOffers.incrementAndGet()
+                worker.execute {
+                    onDemandIdleCheck?.cancel(false)
+                    onDemandIdleCheck = null
+                    if (settings.onDemandSip) _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.IN_CALL) }
+                }
+            },
+            onIncomingHandled = {
+                pendingIncomingOffers.updateAndGet { count -> (count - 1).coerceAtLeast(0) }
+                worker.execute { scheduleOnDemandIdle() }
+            },
         )
         b.addListener { session ->
             val description = describe(session)
             worker.execute {
                 if (bridge !== b) return@execute
                 _health.update { it.copy(session = description) }
+                if (settings.onDemandSip && description != null) {
+                    _health.update { it.copy(gatewayLifecycle = GatewayLifecycle.IN_CALL) }
+                }
                 syncForegroundService()
+                scheduleOnDemandIdle()
                 if (session.endedAtMs != null && !cellular.hasCalls) applyDeferredChanges()
             }
         }
@@ -955,12 +1196,15 @@ class GatewayRuntime private constructor(context: Context) {
         val platformOnly = old.copy(audioMethod = new.audioMethod, callAccess = new.callAccess,
             muteEarpiece = new.muteEarpiece, sipDebugLog = new.sipDebugLog,
             keepDefaultDialer = new.keepDefaultDialer, holdSipWhenNotReady = new.holdSipWhenNotReady,
-            defaultSimSlot = new.defaultSimSlot, inboundExcludedSlots = new.inboundExcludedSlots) == new
+            defaultSimSlot = new.defaultSimSlot, inboundExcludedSlots = new.inboundExcludedSlots,
+            onDemandSip = new.onDemandSip, idleTimeoutSeconds = new.idleTimeoutSeconds,
+            wakeServerUrl = new.wakeServerUrl, wakeRegistrationKey = new.wakeRegistrationKey) == new
         PjsipEndpoint.setVerboseLogging(new.sipDebugLog)
         if (!platformOnly) { startSip(); rebuildBridge() }
         configureCallAccess()
         runSetup()
         updateReadiness()
+        FcmPush.refresh(app, new)
     }
 
     /** pjsip info-level logging; takes effect immediately, persisted for the next start. */
@@ -1146,6 +1390,7 @@ class GatewayRuntime private constructor(context: Context) {
     }
 
     companion object {
+        private const val WAKE_READY_TIMEOUT_SECONDS = 45L
         @Volatile private var instance: GatewayRuntime? = null
 
         /** Outlasts brief Shizuku reconnects; shorter than a typical PBX qualify/failover window. */

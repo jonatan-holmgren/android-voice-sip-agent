@@ -196,6 +196,8 @@ imported changes wait for current calls to end. Import never turns takeover on o
 | `device.callAccess` | `auto`, `companion` or `dialer` (**Call access**) |
 | `device.muteEarpiece` | **Mute call audio on this phone** |
 | `device.keepDefaultDialer` | **Keep this app as the default phone app when gateway is off** |
+| `device.onDemandSip` | **On-demand SIP (FCM)** |
+| `device.idleTimeoutSeconds` | Idle grace before unregistering, 15–600 seconds |
 
 The whole file is checked before anything changes. An unknown key, a wrong type, an out-of-range value or a newer
 `version` rejects the file. The error names the key but never its value. The `device` section depends on the phone
@@ -207,6 +209,18 @@ model and its SIM slots, so review it before importing a file exported on anothe
 
 Check **Health** for setup or registration errors. With takeover on, use **Re-run setup** after granting
 Shizuku access, or **Reconnect SIP** to retry registration with saved credentials.
+
+### On-demand SIP
+
+The optional **On-demand SIP (FCM)** mode keeps SIP dormant between outgoing gateway calls. A small authenticated
+server sends a high-priority Firebase Cloud Messaging wake request; Asterisk waits for the phone's readiness report
+and its PJSIP contact before sending an INVITE. The phone still uses the existing cellular bridge, SIM selection, prefix and emergency checks.
+Carrier call forwarding for incoming calls is independent. See the [on-demand setup and Asterisk guide](docs/ON_DEMAND_SIP.md)
+for Firebase configuration, deployment, background limits, battery measurement and device validation.
+
+FCM does not resolve Android audio-focus conflicts when Acrobits and the gateway run on the same phone. That
+combination needs physical-device testing. An embedded softphone would be a separate feature; the current app
+does not include a user-facing SIP calling UI or local SIP audio path.
 
 ### Advanced settings
 

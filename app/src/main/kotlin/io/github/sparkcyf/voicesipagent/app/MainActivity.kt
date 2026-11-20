@@ -2,9 +2,12 @@ package io.github.sparkcyf.voicesipagent.app
 
 import android.os.Bundle
 import android.os.Build
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
@@ -187,6 +190,7 @@ private fun Screen(rt: GatewayRuntime, editor: SipSettingsDraft, modifier: Modif
                     enabled = actionsEnabled && cur.sipConfigured) { Text("Reconnect SIP") }
             }
         }
+        OnDemandSettings(rt, cur, h)
         Section("Call") {
             Text(h.calls.summary)
             Text(h.session ?: "No active session")
@@ -299,6 +303,65 @@ private fun Screen(rt: GatewayRuntime, editor: SipSettingsDraft, modifier: Modif
         Section("Log") {
             Text(log.takeLast(60).reversed().joinToString("\n"), fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp, lineHeight = 14.sp)
+        }
+    }
+}
+
+@Composable
+private fun OnDemandSettings(rt: GatewayRuntime, cur: GatewaySettings, health: HealthState) {
+    val fcmStatus by FcmPush.status.collectAsState()
+    val context = LocalContext.current
+    var serverUrl by remember(cur.wakeServerUrl) { mutableStateOf(cur.wakeServerUrl) }
+    var registrationKey by remember(cur.wakeRegistrationKey) { mutableStateOf(cur.wakeRegistrationKey) }
+    var idleTimeout by remember(cur.idleTimeoutSeconds) { mutableStateOf(cur.idleTimeoutSeconds.toString()) }
+    var notificationPermission by remember {
+        mutableStateOf(Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context,
+            Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+    }
+    val notificationPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        notificationPermission = it
+    }
+    Section("Gateway availability") {
+        Toggle("On-demand SIP (FCM)", cur.onDemandSip, { on ->
+            if (on && Build.VERSION.SDK_INT >= 33 && !notificationPermission) {
+                notificationPermissionRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            rt.applySettings { copy(onDemandSip = on) }
+        }) {
+            "When enabled, SIP and its native worker threads exist only during a wake window. " +
+                "A high-priority FCM message starts the gateway; SIP authentication still authorizes calls."
+        }
+        Text("FCM: $fcmStatus", style = MaterialTheme.typography.bodySmall)
+        if (cur.onDemandSip && !notificationPermission) {
+            Text("Allow notifications so Android and FCM can show the active gateway notification.",
+                color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        Text("Gateway: ${health.gatewayLifecycle}", style = MaterialTheme.typography.bodySmall)
+        Text("SIP: ${if (health.sip.ready) "registered" else health.sip.detail}", style = MaterialTheme.typography.bodySmall)
+        Text("Last wake: ${health.lastWakeResult}" + (health.lastWakeLatencyMs?.let { " · ${it}ms" } ?: ""),
+            style = MaterialTheme.typography.bodySmall)
+        Text("Shizuku: ${health.shizuku.name.lowercase()} · cellular/audio: " +
+            if (health.cellularReady) "available" else health.readinessDetail,
+            style = MaterialTheme.typography.bodySmall)
+        if (cur.onDemandSip) {
+            Text("Device ID: ${SettingsStore(context).deviceId()}", style = MaterialTheme.typography.bodySmall)
+            OutlinedTextField(value = serverUrl, onValueChange = { serverUrl = it },
+                label = { Text("Wake server HTTPS URL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = registrationKey, onValueChange = { registrationKey = it },
+                label = { Text("Device registration key") }, singleLine = true,
+                visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = idleTimeout, onValueChange = { idleTimeout = it.filter(Char::isDigit).take(3) },
+                label = { Text("Idle timeout (15–600 seconds)") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+            Button(onClick = {
+                val timeout = idleTimeout.toIntOrNull()?.takeIf { it in 15..600 } ?: return@Button
+                if (serverUrl.isNotBlank() && !serverUrl.startsWith("https://")) return@Button
+                rt.applySettings { copy(wakeServerUrl = serverUrl.trim(), wakeRegistrationKey = registrationKey,
+                    idleTimeoutSeconds = timeout) }
+            }, enabled = idleTimeout.toIntOrNull()?.let { it in 15..600 } == true) { Text("Save on-demand settings") }
+            if (health.lastWakeResult.startsWith("Failed")) {
+                Text(health.lastWakeResult, color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }

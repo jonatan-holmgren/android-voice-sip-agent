@@ -1,0 +1,50 @@
+; Install the [from-softphone] context on the authenticated Acrobits endpoint.
+; Set VSA_DEVICE_ID and VSA_WAKE_API_KEY in a root-owned/local secrets include.
+; The API token is never sent to the phone. Give Acrobits only the dialplan context it needs.
+; Example local include contents (use a URL-safe random key):
+;   [globals]
+;   VSA_DEVICE_ID=copy-the-installation-id-from-the-app
+;   VSA_WAKE_API_KEY=replace-with-the-Asterisk-bearer-key
+
+[from-softphone]
+exten => _X.,1,Set(VSA_DEST=${EXTEN})
+ same => n,Gosub(vsa-wake-and-dial,s,1)
+ same => n,Hangup()
+exten => _+X.,1,Set(VSA_DEST=${EXTEN})
+ same => n,Gosub(vsa-wake-and-dial,s,1)
+ same => n,Hangup()
+
+[vsa-wake-and-dial]
+exten => s,1,NoOp(Wake cellular SIP gateway)
+ same => n,Set(VSA_SIM=${PJSIP_HEADER(read,X-VSA-SIMSLOT)})
+ same => n,GotoIf($["${VSA_SIM}" = ""]?wake)
+ same => n,Set(VSA_SIM_VALID=${REGEX("^[0-9]+$" ${VSA_SIM})})
+ same => n,GotoIf($[${VSA_SIM_VALID} = 1]?wake:invalid-sim)
+ same => n(invalid-sim),Hangup(21)
+ same => n(wake),Set(VSA_WAKE_RESPONSE=${SHELL(/usr/bin/curl --silent --show-error --fail --max-time 5 -X POST -H 'Authorization: Bearer ${VSA_WAKE_API_KEY}' -H 'Content-Type: application/json' -H 'Idempotency-Key: ${UNIQUEID}' -d '{"device_id":"${VSA_DEVICE_ID}"}' 'https://wake.example.net/api/v1/wake' 2>/dev/null)})
+ same => n,GotoIf($["${VSA_WAKE_RESPONSE}" = ""]?wake-failed)
+ same => n,Set(VSA_REQUEST_ID=${JSON_DECODE(VSA_WAKE_RESPONSE,request_id)})
+ same => n,GotoIf($["${VSA_REQUEST_ID}" = ""]?wake-failed)
+ same => n,Set(VSA_WAIT=45)
+ same => n(wait-for-contact),Set(VSA_CONTACTS=${PJSIP_DIAL_CONTACTS(android-gw,android-gw-aor,${VSA_DEST})})
+ same => n,Set(VSA_WAKE_STATUS=${SHELL(/usr/bin/curl --silent --show-error --fail --max-time 3 -H 'Authorization: Bearer ${VSA_WAKE_API_KEY}' 'https://wake.example.net/api/v1/wake/${VSA_REQUEST_ID}' 2>/dev/null)})
+ same => n,Set(VSA_WAKE_STATE=${JSON_DECODE(VSA_WAKE_STATUS,state)})
+ same => n,GotoIf($["${VSA_WAKE_STATE}" = "failed"]?wake-timeout)
+ same => n,GotoIf($["${VSA_WAKE_STATE}" = "ready" & "${VSA_CONTACTS}" != ""]?dial)
+ same => n,Wait(1)
+ same => n,Set(VSA_WAIT=$[${VSA_WAIT} - 1])
+ same => n,GotoIf($[${VSA_WAIT} > 0]?wait-for-contact:wake-timeout)
+ same => n(dial),Dial(${VSA_CONTACTS},60,b(vsa-add-sim^s^1(${VSA_SIM})))
+ same => n,Return()
+ same => n(wake-failed),NoOp(Gateway wake service unavailable)
+ same => n,Hangup(38)
+ same => n(wake-timeout),NoOp(Gateway SIP contact did not register before timeout)
+ same => n,Hangup(34)
+
+[vsa-add-sim]
+exten => s,1,ExecIf($["${ARG1}" != ""]?Set(PJSIP_HEADER(add,X-VSA-SIMSLOT)=${ARG1}))
+ same => n,Return()
+
+[from-android-gateway]
+; Add only the inbound routes required by this trunk. Never expose arbitrary dialing here.
+exten => _X.,1,Hangup(21)

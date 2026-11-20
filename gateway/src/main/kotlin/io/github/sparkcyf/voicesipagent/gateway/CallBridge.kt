@@ -62,6 +62,8 @@ class CallBridge(
     private val config: GatewayConfig,
     private val dialPolicyForA: DialPolicy = DialPolicy { null },
     private val log: (String) -> Unit = {},
+    private val onIncomingOffered: (CallLeg) -> Unit = {},
+    private val onIncomingHandled: (CallLeg) -> Unit = {},
 ) {
     private val executor: ScheduledExecutorService =
         ScheduledThreadPoolExecutor(1) { r -> Thread(r, "call-bridge").apply { isDaemon = true } }.apply {
@@ -116,9 +118,27 @@ class CallBridge(
 
     private fun postIncoming(leg: CallLeg, block: () -> Unit) {
         // An endpoint may have captured this handler before stop removed it.
-        if (stopping.get() || !post {
-            if (stopping.get()) leg.hangup(HangupCause.UNAVAILABLE) else block()
-        }) leg.hangup(HangupCause.UNAVAILABLE)
+        if (stopping.get()) {
+            leg.hangup(HangupCause.UNAVAILABLE)
+            return
+        }
+        try {
+            onIncomingOffered(leg)
+        } catch (t: Throwable) {
+            log("incoming-offer callback failed: $t")
+            leg.hangup(HangupCause.UNAVAILABLE)
+            return
+        }
+        if (!post {
+            try {
+                if (stopping.get()) leg.hangup(HangupCause.UNAVAILABLE) else block()
+            } finally {
+                onIncomingHandled(leg)
+            }
+        }) {
+            onIncomingHandled(leg)
+            leg.hangup(HangupCause.UNAVAILABLE)
+        }
     }
 
     private fun onInbound(leg: CallLeg, from: CallEndpoint, to: CallEndpoint, route: RouteTarget) {

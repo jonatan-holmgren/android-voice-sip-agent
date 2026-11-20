@@ -15,6 +15,10 @@ android {
         targetSdk = 36
         versionCode = 7
         versionName = "0.4.2"
+        buildConfigField("String", "FIREBASE_API_KEY", "\"${providers.gradleProperty("vsa.firebase.apiKey").orNull.orEmpty()}\"")
+        buildConfigField("String", "FIREBASE_APP_ID", "\"${providers.gradleProperty("vsa.firebase.appId").orNull.orEmpty()}\"")
+        buildConfigField("String", "FIREBASE_PROJECT_ID", "\"${providers.gradleProperty("vsa.firebase.projectId").orNull.orEmpty()}\"")
+        buildConfigField("String", "FIREBASE_SENDER_ID", "\"${providers.gradleProperty("vsa.firebase.senderId").orNull.orEmpty()}\"")
         // Filter all transitive JNI libraries as well as PJSIP's own module outputs.
         ndk {
             //abiFilters += listOf("arm64-v8a", "x86_64")
@@ -50,6 +54,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         resources.excludes += "META-INF/*.kotlin_module"
@@ -72,6 +77,8 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
     testImplementation(libs.junit)
     testImplementation(libs.mockito.core)
     testImplementation(libs.android.json)

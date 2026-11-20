@@ -1,0 +1,38 @@
+; Use a verified TLS transport and a unique, randomly generated trunk password.
+; Include this fragment from pjsip.conf and set file permissions on local secrets.
+
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+cert_file=/etc/asterisk/keys/pbx-fullchain.pem
+priv_key_file=/etc/asterisk/keys/pbx-key.pem
+method=tlsv1_2
+
+[android-gw-auth]
+type=auth
+auth_type=userpass
+username=android-gw
+password=REPLACE_WITH_LONG_RANDOM_SECRET
+
+[android-gw-aor]
+type=aor
+max_contacts=1
+remove_existing=yes
+; No qualify_frequency: dormant mode must not need SIP OPTIONS probes.
+
+[android-gw]
+type=endpoint
+transport=transport-tls
+context=from-android-gateway
+disallow=all
+allow=ulaw,alaw
+auth=android-gw-auth
+aors=android-gw-aor
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+media_encryption=sdes
+; The app verifies the PBX TLS certificate unless the user explicitly changes that setting.
+; Configure an inbound Acrobits endpoint with its own authentication and a restricted context.

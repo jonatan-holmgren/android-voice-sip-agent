@@ -38,6 +38,15 @@ class GatewayServicePolicyTest {
         assertTrue(lost.copy(calls = CallSnapshot(), session = "SIP call finishing").needsForegroundService)
     }
 
+    @Test fun onDemandModeHasNoDormantForegroundServiceButRetainsOneForCalls() {
+        val dormant = HealthState(takeover = true, onDemandSip = true)
+        assertFalse(dormant.needsForegroundService)
+        assertTrue(dormant.copy(gatewayRunning = true).needsForegroundService)
+        assertTrue(dormant.copy(calls = CallSnapshot(count = 1, owned = 1)).needsForegroundService)
+        assertFalse(dormant.copy(holdsDialer = true).needsForegroundService)
+        assertTrue(HealthState(takeover = true).needsForegroundService)
+    }
+
     @Test fun notificationTellsUserToTapAfterRestartingShizuku() {
         val down = HealthState(takeover = true, shizuku = ShizukuConnector.State.SHIZUKU_NOT_RUNNING)
         assertEquals("Shizuku is not running. Start Shizuku, then tap here to reconnect.", GatewayService.summary(down))

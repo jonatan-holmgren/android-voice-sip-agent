@@ -48,6 +48,8 @@ class CellularEndpoint(
     private val defaultSlot: () -> Int = { DefaultSim.SYSTEM },
     /** Slots whose incoming calls stay with the phone app; read at each incoming call. */
     private val inboundExcluded: () -> Set<Int> = { emptySet() },
+    /** Master inbound ownership gate; on-demand outbound gateway mode leaves carrier calls alone. */
+    private val acceptIncoming: () -> Boolean = { true },
 ) : CallEndpoint {
     override val name = "cellular"
 
@@ -257,6 +259,7 @@ class CellularEndpoint(
 
     /** An unknown slot is taken over only while no SIM is excluded. */
     private fun takesInbound(slot: Int?): Boolean {
+        if (!acceptIncoming()) return false
         val excluded = inboundExcluded()
         return if (slot == null) excluded.isEmpty() else slot !in excluded
     }

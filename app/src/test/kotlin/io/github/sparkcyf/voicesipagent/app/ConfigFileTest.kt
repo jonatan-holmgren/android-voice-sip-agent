@@ -11,7 +11,8 @@ import org.junit.Test
 
 class ConfigFileTest {
     private val full = GatewaySettings(
-        takeover = false, keepDefaultDialer = true, muteEarpiece = false,
+        takeover = false, onDemandSip = true, idleTimeoutSeconds = 75,
+        keepDefaultDialer = true, muteEarpiece = false,
         server = "sip.example.org", port = 5061, sipTransport = "tls", srtp = "mandatory",
         tlsVerify = false, tlsCa = TEST_CERT_PEM,
         sipDebugLog = true, holdSipWhenNotReady = false, username = "android-gw", password = "test-secret",
@@ -30,9 +31,10 @@ class ConfigFileTest {
         assertEquals("[\"+1\",\"00\"]", json.getJSONObject("routing").getJSONArray("prefixes").toString())
         assertEquals("[0,1]", json.getJSONObject("routing").getJSONArray("inboundExcludedSlots").toString())
         assertFalse(text.contains("takeover"))
+        assertFalse(ConfigFile.export(full.copy(wakeRegistrationKey = "private-token")).contains("private-token"))
 
         val imported = ConfigFile.parse(text)
-        assertEquals(22, imported.keys.size)
+        assertEquals(24, imported.keys.size)
         // Takeover is the only setting the file leaves alone.
         assertEquals(full.copy(takeover = true), imported.applyTo(GatewaySettings(takeover = true)))
     }
@@ -103,6 +105,7 @@ class ConfigFileTest {
             """{$header, "routing": {"defaultSim": -1}}""" to "routing.defaultSim must be",
             """{$header, "routing": {"inboundExcludedSlots": [0, -1]}}""" to "routing.inboundExcludedSlots must be",
             """{$header, "device": {"audioMethod": 2}}""" to "device.audioMethod must be one of auto | redirection | direct",
+            """{$header, "device": {"idleTimeoutSeconds": 10}}""" to "device.idleTimeoutSeconds must be",
         )
         for ((text, expected) in cases) {
             val error = assertThrows(text, ConfigFile.Invalid::class.java) { ConfigFile.parse(text) }

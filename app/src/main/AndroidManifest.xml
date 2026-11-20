@@ -61,7 +61,15 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps a SIP registration alive to bridge cellular calls to a PBX" />
+                android:value="Starts the SIP cellular gateway on an authorized call request and stops it after idle grace" />
+        </service>
+
+        <service
+            android:name=".GatewayMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
         </service>
 
         <receiver

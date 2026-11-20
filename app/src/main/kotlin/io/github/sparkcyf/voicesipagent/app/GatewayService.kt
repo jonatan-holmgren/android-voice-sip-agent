@@ -51,7 +51,8 @@ class GatewayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val runtime = GatewayRuntime.get(this)
-        if (!runtime.health.value.needsForegroundService) {
+        val wakeRequested = intent?.action == ACTION_WAKE
+        if (!wakeRequested && !runtime.health.value.needsForegroundService) {
             stopGateway(startId)
             return START_NOT_STICKY
         }
@@ -65,7 +66,9 @@ class GatewayService : Service() {
                 return START_NOT_STICKY
             }
         }
-        runtime.onForegroundStarted(runtimeToken)
+        if (!runtime.settings.onDemandSip || wakeRequested || runtime.health.value.gatewayRunning) {
+            runtime.onForegroundStarted(runtimeToken)
+        }
         if (statusJob == null) {
             val nm = getSystemService(NotificationManager::class.java)
             statusJob = scope.launch {
@@ -125,6 +128,7 @@ class GatewayService : Service() {
     companion object {
         private const val CHANNEL = "gateway"
         private const val NOTIFICATION_ID = 1
+        private const val ACTION_WAKE = "io.github.sparkcyf.voicesipagent.WAKE"
 
         fun start(context: Context) {
             val runtime = GatewayRuntime.get(context)
@@ -132,7 +136,22 @@ class GatewayService : Service() {
             sync(context, runtime.health.value)
         }
 
+        internal fun startForWake(context: Context): Boolean {
+            val intent = Intent(context, GatewayService::class.java).setAction(ACTION_WAKE)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+                return true
+            } catch (e: Exception) {
+                AppLog.w("Android blocked on-demand foreground service startup", e)
+                return false
+            }
+        }
+
         internal fun summary(h: HealthState): String = when {
+            h.gatewayLifecycle == GatewayLifecycle.WAKING || h.gatewayLifecycle == GatewayLifecycle.INITIALIZING -> "Waking gateway"
+            h.gatewayLifecycle == GatewayLifecycle.REGISTERING -> "Registering SIP"
+            h.gatewayLifecycle == GatewayLifecycle.IDLE_GRACE -> "Ready · idle shutdown in progress"
+            h.gatewayLifecycle == GatewayLifecycle.ERROR -> "Gateway error · ${h.lastWakeResult}"
             h.session != null -> "In call · ${h.session}"
             !h.takeover && h.holdsDialer -> "Takeover off. Still your default phone app; change it in Settings."
             !h.takeover -> "Call takeover off"

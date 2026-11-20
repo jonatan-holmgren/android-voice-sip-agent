@@ -200,6 +200,10 @@ object ConfigFile {
                 toJson = { JSONArray(it.sorted()) }, fromJson = { intList(it)?.toSet() }),
         ),
         "device" to listOf(
+            bool("onDemandSip", { it.onDemandSip }, { copy(onDemandSip = it) }),
+            Field("idleTimeoutSeconds", { it.idleTimeoutSeconds }, { copy(idleTimeoutSeconds = it) },
+                "an integer from 15 to 600 seconds",
+                fromJson = { (it as? Int)?.takeIf { seconds -> seconds in 15..600 } }),
             choice("audioMethod", { it.audioMethod }, { copy(audioMethod = it) },
                 mapOf(AudioMethod.AUTO to "auto", AudioMethod.OFFICIAL to "redirection", AudioMethod.LEGACY to "direct")),
             choice("callAccess", { it.callAccess }, { copy(callAccess = it) },

@@ -3,6 +3,8 @@
 Detailed usage, build, and implementation notes for Voice SIP Agent. See the
 [README](README.md) for installation, SIP server configuration, supported devices, and build commands.
 
+The optional [on-demand SIP mode](docs/ON_DEMAND_SIP.md) uses FCM to wake the existing runtime and releases the PJSUA2 library after its idle grace. Always-on mode keeps PJLIB's SIP event loop active and PJMEDIA's separate RTP/RTCP worker can wake about every 10 ms while idle; battery use is unmeasured. On-demand teardown stops both workers and releases the SIP transport. Compare `dumpsys batterystats` on the same device and network before treating battery savings as established.
+
 - [Call access and takeover](#call-access-and-takeover)
 - [Audio formats and routing](#audio-formats-and-routing)
 - [Native dependencies](#native-dependencies)

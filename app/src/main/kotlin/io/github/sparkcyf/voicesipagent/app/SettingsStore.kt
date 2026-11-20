@@ -19,6 +19,12 @@ import javax.crypto.spec.GCMParameterSpec
 data class GatewaySettings(
     /** Master switch; call cleanup and default-dialer restoration may finish later. */
     val takeover: Boolean = true,
+    /** Keep SIP dormant between gateway requests; FCM wakes the foreground service on demand. */
+    val onDemandSip: Boolean = false,
+    /** Grace after the last call before SIP and its native library are released. */
+    val idleTimeoutSeconds: Int = 60,
+    val wakeServerUrl: String = "",
+    val wakeRegistrationKey: String = "",
     /** Retain the role on switch-off instead of returning to the saved dialer. */
     val keepDefaultDialer: Boolean = false,
     /** Mute local call output while bridged. Telecom manages microphone mute independently. */
@@ -58,7 +64,7 @@ data class GatewaySettings(
     val sipConfigured: Boolean get() = server.isNotBlank() && username.isNotBlank() && password.isNotEmpty()
 
     override fun toString() =
-        "GatewaySettings(takeover=$takeover muteEarpiece=$muteEarpiece stack=$sipStack server=$server:$port/$sipTransport srtp=$srtp tlsVerify=$tlsVerify tlsCa=${TlsCertificates.label(tlsCa)} holdSip=$holdSipWhenNotReady user=$username target=$inboundTarget)"
+        "GatewaySettings(takeover=$takeover onDemandSip=$onDemandSip idleTimeoutSeconds=$idleTimeoutSeconds wakeServerConfigured=${wakeServerUrl.isNotBlank()} wakeKeyConfigured=${wakeRegistrationKey.isNotBlank()} muteEarpiece=$muteEarpiece stack=$sipStack server=$server:$port/$sipTransport srtp=$srtp tlsVerify=$tlsVerify tlsCa=${TlsCertificates.label(tlsCa)} holdSip=$holdSipWhenNotReady user=$username target=$inboundTarget)"
 }
 
 enum class SipStack(val id: String) {
@@ -78,8 +84,51 @@ enum class SipStack(val id: String) {
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
 
+    internal fun seenWakeRequests(): Set<String> =
+        prefs.getStringSet("wake_request_ids", emptySet())?.toSet().orEmpty()
+
+    internal fun recordWakeRequest(requestId: String, existing: Set<String>, expiresAtEpochMs: Long) {
+        val pending = prefs.getStringSet("pending_wake_requests", emptySet())?.toMutableSet().orEmpty()
+        pending.removeAll { entry ->
+            val expiry = entry.substringAfterLast(':', "").toLongOrNull()
+            expiry == null || expiry <= System.currentTimeMillis()
+        }
+        pending += "$requestId:$expiresAtEpochMs"
+        prefs.edit()
+            .putStringSet("wake_request_ids", (existing + requestId).takeLast(WakeRequestTracker.MAX_IDS).toSet())
+            .putStringSet("pending_wake_requests", pending.takeLast(WakeRequestTracker.MAX_IDS).toSet())
+            .apply()
+    }
+
+    internal fun pendingWakeRequests(nowEpochMs: Long): Map<String, Long> {
+        val raw = prefs.getStringSet("pending_wake_requests", emptySet())?.toSet().orEmpty()
+        val pending = raw.mapNotNull { entry ->
+            val id = entry.substringBeforeLast(':', "")
+            val expiry = entry.substringAfterLast(':', "").toLongOrNull()
+            if (id.isNotEmpty() && expiry != null && expiry > nowEpochMs) id to expiry else null
+        }.toMap()
+        if (pending.size != raw.size) {
+            prefs.edit().putStringSet("pending_wake_requests", pending.map { (id, expiry) -> "$id:$expiry" }.toSet()).apply()
+        }
+        return pending
+    }
+
+    internal fun completeWakeRequest(requestId: String) {
+        val pending = prefs.getStringSet("pending_wake_requests", emptySet())?.toMutableSet().orEmpty()
+        pending.removeAll { it.substringBeforeLast(':', "") == requestId }
+        prefs.edit().putStringSet("pending_wake_requests", pending).apply()
+    }
+
+    internal fun deviceId(): String = prefs.getString("fcm_device_id", null) ?: java.util.UUID.randomUUID().toString().also {
+        prefs.edit().putString("fcm_device_id", it).apply()
+    }
+
     fun load(): GatewaySettings = GatewaySettings(
         takeover = prefs.getBoolean("takeover", true),
+        onDemandSip = prefs.getBoolean("on_demand_sip", false),
+        idleTimeoutSeconds = prefs.getInt("idle_timeout_seconds", 60).coerceIn(15, 600),
+        wakeServerUrl = prefs.getString("wake_server_url", "")!!,
+        wakeRegistrationKey = prefs.getString("wake_registration_key", null)?.let(::unseal).orEmpty(),
         keepDefaultDialer = prefs.getBoolean("keep_default_dialer", false),
         muteEarpiece = prefs.getBoolean("mute_earpiece", true),
         server = prefs.getString("server", "")!!,
@@ -108,6 +157,10 @@ class SettingsStore(context: Context) {
     fun save(s: GatewaySettings) {
         prefs.edit()
             .putBoolean("takeover", s.takeover)
+            .putBoolean("on_demand_sip", s.onDemandSip)
+            .putInt("idle_timeout_seconds", s.idleTimeoutSeconds.coerceIn(15, 600))
+            .putString("wake_server_url", s.wakeServerUrl.trim())
+            .putString("wake_registration_key", seal(s.wakeRegistrationKey))
             .putBoolean("keep_default_dialer", s.keepDefaultDialer)
             .putBoolean("mute_earpiece", s.muteEarpiece)
             .putString("server", s.server.trim())
